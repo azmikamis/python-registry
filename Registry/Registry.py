@@ -19,6 +19,8 @@
 from __future__ import print_function
 
 import sys
+import ntpath
+from enum import Enum
 
 from . import RegistryParse
 
@@ -34,6 +36,22 @@ RegLink = 0x0006
 RegResourceList = 0x0008
 RegFullResourceDescriptor = 0x0009
 RegResourceRequirementsList = 0x000A
+RegFileTime = 0x0010
+
+DEVPROP_MASK_TYPE = 0x00000FFF
+
+class HiveType(Enum):
+    UNKNOWN = ""
+    NTUSER = "ntuser.dat"
+    SAM = "sam"
+    SECURITY = "security"
+    SOFTWARE = "software"
+    SYSTEM = "system"
+    USRCLASS = "usrclass.dat"
+    BCD = "bcd"
+    COMPONENTS = "components"
+    DEFAULT = "default"
+    SCHEMA = "schema.dat"
 
 
 class RegistryKeyHasNoParentException(RegistryParse.RegistryStructureDoesNotExist):
@@ -141,6 +159,9 @@ class RegistryValue(object):
     def value(self):
         return self._vkrecord.data()
 
+    def raw_data(self):
+        return self._vkrecord.raw_data()
+
 
 class RegistryKey(object):
     """
@@ -247,9 +268,12 @@ class RegistryKey(object):
         """
         if name == "(default)":
             name = ""
-        for v in self._nkrecord.values_list().values():
-            if v.name().lower() == name.lower():
-                return RegistryValue(v)
+        try:
+            for v in self._nkrecord.values_list().values():
+                if v.name().lower() == name.lower():
+                    return RegistryValue(v)
+        except RegistryParse.RegistryStructureDoesNotExist:
+            raise RegistryValueNotFoundException(self.path() + " : " + name)
         raise RegistryValueNotFoundException(self.path() + " : " + name)
 
     def find_key(self, path):
@@ -261,6 +285,18 @@ class RegistryKey(object):
 
         (immediate, _, future) = path.partition("\\")
         return self.subkey(immediate).find_key(future)
+        
+    def values_number(self):
+    	"""
+    	Return the number of values associated with this key
+    	"""
+    	return self._nkrecord.values_number()
+    	
+    def subkeys_number(self):
+    	"""
+    	Return the number of subkeys associated with this key
+    	"""
+    	return self._nkrecord.subkey_number()
 
 
 class Registry(object):
@@ -282,6 +318,39 @@ class Registry(object):
                 self._buf = f.read()
         self._regf = RegistryParse.REGFBlock(self._buf, 0, False)
 
+    def hive_name(self):
+        """Returns the internal file name"""
+        return self._regf.hive_name()
+
+    def hive_type(self):
+        """Returns the hive type"""
+        temp = self.hive_name()
+        temp = temp.replace('\\??\\', '')
+        temp = ntpath.basename(temp)
+
+        if temp.lower() == HiveType.NTUSER.value:
+            return HiveType.NTUSER
+        elif temp.lower() == HiveType.SAM.value:
+            return HiveType.SAM
+        elif temp.lower() == HiveType.SECURITY.value:
+            return HiveType.SECURITY
+        elif temp.lower() == HiveType.SOFTWARE.value:
+            return HiveType.SOFTWARE
+        elif temp.lower() == HiveType.SYSTEM.value:
+            return HiveType.SYSTEM
+        elif temp.lower() == HiveType.USRCLASS.value:
+            return HiveType.USRCLASS
+        elif temp.lower() == HiveType.BCD.value:
+            return HiveType.BCD
+        elif temp.lower() == HiveType.COMPONENTS.value:
+            return HiveType.COMPONENTS
+        elif temp.lower() == HiveType.DEFAULT.value:
+            return HiveType.DEFAULT
+        elif temp.lower() == HiveType.SCHEMA.value:
+            return HiveType.SCHEMA
+        else:
+            return HiveType.UNKNOWN
+
     def root(self):
         """
         Return the first RegistryKey in the hive.
@@ -299,7 +368,6 @@ class Registry(object):
         # are there any other keys at this
         # level? is this the name of the hive?
         return RegistryKey(self._regf.first_key()).find_key(path)
-
 
 def print_all(key):
     if len(key.subkeys()) == 0:

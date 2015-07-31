@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from distutils.core import setup
+from setuptools import setup
 from Registry import _version_
 
 setup(name='python-registry',
@@ -14,6 +14,7 @@ setup(name='python-registry',
       classifiers = ["Programming Language :: Python",
                      "Programming Language :: Python :: 3",
                      "Operating System :: OS Independent", 
-                     "License :: OSI Approved :: Apache Software License"]
+                     "License :: OSI Approved :: Apache Software License"],
+     install_requires=["enum34"]
      )
 

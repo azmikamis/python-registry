@@ -37,12 +37,11 @@ RegLink = 0x0006
 RegResourceList = 0x0008
 RegFullResourceDescriptor = 0x0009
 RegResourceRequirementsList = 0x000A
+RegFileTime = 0x0010
 
-_global_warning_messages = []
-def warn(msg):
-    if msg not in _global_warning_messages:
-        _global_warning_messages.append(msg)
-        print("Warning: %s" % (msg))
+# Added in Windows Vista. Must be applied to Registry type.
+# see: http://msdn.microsoft.com/en-us/library/windows/hardware/ff543550%28v=vs.85%29.aspx
+DEVPROP_MASK_TYPE = 0x00000FFF
 
 
 def parse_windows_timestamp(qword):
@@ -119,6 +118,7 @@ class UnknownTypeException(RegistryException):
      - RegResourceList
      - RegFullResourceDescriptor
      - RegResourceRequirementsList
+     - RegFileTime
     """
     def __init__(self, value):
         """
@@ -153,6 +153,9 @@ class RegistryBlock(object):
         self._buf = buf
         self._offset = offset
         self._parent = parent
+
+    def unpack_binary(self, offset, length):
+        return self._buf[self._offset + offset:self._offset + offset + length]
 
     def unpack_word(self, offset):
         """
@@ -235,14 +238,31 @@ class REGFBlock(RegistryBlock):
         if _id != 0x66676572:
             raise ParseException("Invalid REGF ID")
 
-        _seq1 = self.unpack_dword(0x4)
-        _seq2 = self.unpack_dword(0x8)
+    def hive_sequence1(self):
+        """
+        Get first sequence number.
+        Believed to be saved when a commit is started.
+        """
+        return self.unpack_dword(0x4)
 
-        if _seq1 != _seq2:
-            # the registry was not synchronized
-            pass
+    def hive_sequence2(self):
+        """
+        Get second sequence number.
+        Believed to be saved to the same value as squence1 when a commit is completed.
+        """
+        return self.unpack_dword(0x8)
 
-        # TODO: compute checksum and check
+    def validate_sequence_numbers(self):
+        """
+        Compare if sequence numbers is correct.
+        """
+        return self.hive_sequence1() == self.hive_sequence2()
+
+    def modification_timestamp(self):
+        """
+        Get the modified timestamp as a Python datetime.
+        """
+        return parse_windows_timestamp(self.unpack_qword(0xC))
 
     def major_version(self):
         """
@@ -264,11 +284,49 @@ class REGFBlock(RegistryBlock):
         """
         return self.unpack_string(0x30, 64).decode("utf-16le").rstrip("\x00")
 
+    def first_hbin_offset(self):
+        """
+        Get the buffer offset of the first HBINBlock as an unsigned integer.
+        Note: always returns 0x1000 nothing else is known.
+        """
+        return 0x1000
+
     def last_hbin_offset(self):
         """
         Get the buffer offset of the last HBINBlock as an unsigned integer.
         """
         return self.unpack_dword(0x28)
+
+    def calculate_checksum(self):
+        """
+        checksum is calculated over the first 0x200 bytes
+        XOR of all D-Words from 0x00000000 to 0x000001FB
+        """
+        xsum = 0
+        idx = 0x0
+        # it is possible to use 0x1FC instead and expect zero for a valid hive.
+        while idx <= 0x1FB:
+            xsum ^= self.unpack_dword(idx)
+            idx += 0x4
+        return xsum
+
+    def checksum(self):
+        """
+        Get the checksum stored in hive.
+        """
+        return self.unpack_dword(0x1FC)
+
+    def validate_checksum(self):
+        """
+        Is the file checksum valid.
+        """
+        return self.calculate_checksum() == self.checksum()
+
+    def validate(self):
+        """
+        Is the file checksum and sequence valid.
+        """
+        return self.validate_checksum() and self.validate_sequence_numbers()
 
     def first_key(self):
         first_hbin = next(self.hbins())
@@ -282,7 +340,7 @@ class REGFBlock(RegistryBlock):
         """
         A generator that enumerates all HBIN (HBINBlock) structures in this Windows Registry.
         """
-        h = HBINBlock(self._buf, 0x1000, self) # sorry, but 0x1000 is a magic number
+        h = HBINBlock(self._buf, self.first_hbin_offset(), self)
         yield h
 
         while h.has_next():
@@ -385,7 +443,7 @@ class HBINCell(RegistryBlock):
             raise RegistryStructureDoesNotExist("HBINCell is free at 0x%x" % (self.offset()))
 
         id_ = self.data_id()
-        
+
         if id_ == b"vk":
             return VKRecord(self._buf, self.data_offset(), self)
         elif id_ == b"nk":
@@ -604,6 +662,8 @@ class VKRecord(Record):
             return "RegFullResourceDescriptor"
         elif data_type == RegResourceRequirementsList:
             return "RegResourceRequirementsList"
+        elif data_type == RegFileTime:
+            return "RegFileTime"
         else:
             return "Unknown type: %s" % (hex(data_type))
 
@@ -625,6 +685,8 @@ class VKRecord(Record):
             data = "(none)"
         elif data_type == RegBin:
             data = "(binary)"
+        elif data_type == RegFileTime:
+            data = self.data().isoformat("T") + "Z"
         else:
             data = "(unsupported)"
 
@@ -655,20 +717,20 @@ class VKRecord(Record):
             return ""
         else:
             name_length = self.unpack_word(0x2)
-            return self.unpack_string(0x14, name_length).decode("ascii")
+            return self.unpack_string(0x14, name_length).decode("windows-1252")
 
     def data_type(self):
         """
         Get the data type of this value data as an unsigned integer.
         """
-        return self.unpack_dword(0xC)
+        return self.unpack_dword(0xC) & DEVPROP_MASK_TYPE
 
     def data_length(self):
         """
         Get the length of this value data. This is the actual length of the data that should be parsed for the value.
         """
         size = self.unpack_dword(0x4)
-        if size > 0x80000000:
+        if size >= 0x80000000:
             size -= 0x80000000
         return size
 
@@ -687,9 +749,109 @@ class VKRecord(Record):
         else:
             return self.abs_offset_from_hbin_offset(self.unpack_dword(0x8))
 
+    def raw_data(self):
+        """
+        Get the unparsed raw data.
+        """
+        data_type = self.data_type()
+        data_length = self.raw_data_length()
+        data_offset = self.data_offset()
+        ret = None
+
+        if data_type == RegSZ or data_type == RegExpandSZ:
+            if data_length >= 0x80000000:
+                # data is contained in the data_offset field
+                ret = self._buf[data_offset:data_offset + 0x4]
+            elif 0x3fd8 < data_length < 0x80000000:
+                d = HBINCell(self._buf, data_offset, self)
+                if d.data_id() == b"db":
+                    # this should always be the case
+                    # but empirical testing does not confirm this
+                    ret = d.child().large_data(data_length)
+                else:
+                    ret = d.raw_data()[:data_length]
+            else:
+                d = HBINCell(self._buf, data_offset, self)
+                data_offset = d.data_offset()
+                ret = self._buf[data_offset:data_offset + data_length]
+        elif data_type == RegBin or data_type == RegNone:
+            if data_length >= 0x80000000:
+                data_length -= 0x80000000
+                ret = self._buf[data_offset:data_offset + data_length]
+            elif 0x3fd8 < data_length < 0x80000000:
+                d = HBINCell(self._buf, data_offset, self)
+                if d.data_id() == b"db":
+                    # this should always be the case
+                    # but empirical testing does not confirm this
+                    ret = d.child().large_data(data_length)
+                else:
+                    ret = d.raw_data()[:data_length]
+            else:
+                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
+        elif data_type == RegDWord:
+            ret = self.unpack_binary(0x8, 0x4)
+        elif data_type == RegMultiSZ:
+            if data_length >= 0x80000000:
+                # this means data_length < 5, so it must be 4, and
+                # be composed of completely \x00, so the strings are empty
+                ret = b""
+            elif 0x3fd8 < data_length < 0x80000000:
+                d = HBINCell(self._buf, data_offset, self)
+                if d.data_id() == b"db":
+                    ret = d.child().large_data(data_length)
+                else:
+                    ret = d.raw_data()[:data_length]
+            else:
+                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
+        elif data_type == RegQWord:
+            d = HBINCell(self._buf, data_offset, self)
+            data_offset = d.data_offset()
+            ret = self._buf[data_offset:data_offset + 0x8]
+        elif data_type == RegBigEndian:
+            d = HBINCell(self._buf, data_offset, self)
+            data_offset = d.data_offset()
+            ret = self._buf[data_offset:data_offset + 4]
+        elif data_type == RegLink or \
+                        data_type == RegResourceList or \
+                        data_type == RegFullResourceDescriptor or \
+                        data_type == RegResourceRequirementsList:
+            if data_length >= 0x80000000:
+                data_length -= 0x80000000
+                ret = self._buf[data_offset:data_offset + data_length]
+            elif 0x3fd8 < data_length < 0x80000000:
+                d = HBINCell(self._buf, data_offset, self)
+                if d.data_id() == b"db":
+                    # this should always be the case
+                    # but empirical testing does not confirm this
+                    ret = d.child().large_data(data_length)
+                else:
+                    ret = d.raw_data()[:data_length]
+            else:
+                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
+        elif data_type == RegFileTime:
+            ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
+        elif data_length < 5 or data_length >= 0x80000000:
+            ret = self.unpack_binary(0x8, 4)
+        else:
+            if data_length >= 0x80000000:
+                data_length -= 0x80000000
+                ret = self._buf[data_offset:data_offset + data_length]
+            elif 0x3fd8 < data_length < 0x80000000:
+                d = HBINCell(self._buf, data_offset, self)
+                if d.data_id() == b"db":
+                    # this should always be the case
+                    # but empirical testing does not confirm this
+                    ret = d.child().large_data(data_length)
+                else:
+                    ret = d.raw_data()[:data_length]
+            else:
+                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
+        return ret
+
     def data(self):
         """
-        Get the data.  This method will return various types based on the data type.
+        Get the parsed data.
+        This method will return various types based on the data type.
 
         RegSZ:
           Return a string containing the data, doing the best we can to convert it
@@ -717,84 +879,37 @@ class VKRecord(Record):
           Not currently supported. TODO.
         RegResourceRequirementsList:
           Not currently supported. TODO.
+        RegFileTime:
+          Return a datime.datetime object
         """
         data_type = self.data_type()
         data_length = self.raw_data_length()
-        data_offset = self.data_offset()
+        d = self.raw_data()
 
         if data_type == RegSZ or data_type == RegExpandSZ:
-            if data_length >= 0x80000000:
-                # data is contained in the data_offset field
-                s = struct.unpack_from(str("<%ds") % (4), self._buf, data_offset)[0]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    s = d.child().large_data(data_length)
-                else:
-                    s = d.raw_data()[:data_length]
-            else:
-                d = HBINCell(self._buf, data_offset, self)
-                s = struct.unpack_from(str("<%ds") % (data_length), self._buf, d.data_offset())[0]
-            s = decode_utf16le(s)
-            return s
+            return decode_utf16le(d)
         elif data_type == RegBin or data_type == RegNone:
-            if data_length >= 0x80000000:
-                data_length -= 0x80000000
-                return self._buf[data_offset:data_offset + data_length]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    return d.child().large_data(data_length)
-                else:
-                    return d.raw_data()[:data_length]
-            return self._buf[data_offset + 4:data_offset + 4 + data_length]
+            return d
         elif data_type == RegDWord:
-            return self.unpack_dword(0x8)
+            return struct.unpack_from(str("<I"), d, 0)[0]
         elif data_type == RegMultiSZ:
-            if data_length >= 0x80000000:
-                # this means data_length < 5, so it must be 4, and
-                # be composed of completely \x00, so the strings are empty
-                return []
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    s = d.child().large_data(data_length)
-                else:
-                    s = d.raw_data()[:data_length]
-            else:
-                s = self._buf[data_offset + 4:data_offset + 4 + data_length]
-            s = s.decode("utf16")
+            s = d.decode("utf16")
             return s.split("\x00")
         elif data_type == RegQWord:
-            d = HBINCell(self._buf, data_offset, self)
-            return struct.unpack_from(str("<Q"), self._buf, d.data_offset())[0]
+            return struct.unpack_from(str("<Q"), d, 0)[0]
         elif data_type == RegBigEndian:
-            d = HBINCell(self._buf, data_offset, self)
-            return struct.unpack_from(str(">I"), self._buf, d.data_offset())[0]
+            return struct.unpack_from(str(">I"), d, 0)[0]
         elif data_type == RegLink or \
                         data_type == RegResourceList or \
                         data_type == RegFullResourceDescriptor or \
                         data_type == RegResourceRequirementsList:
             # we don't really support these types, but can at least
             #  return raw binary for someone else to work with.
-            if data_length >= 0x80000000:
-                data_length -= 0x80000000
-                return self._buf[data_offset:data_offset + data_length]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    return d.child().large_data(data_length)
-                else:
-                    return d.raw_data()[:data_length]
-            return self._buf[data_offset + 4:data_offset + 4 + data_length]
+            return d
+        elif data_type == RegFileTime:
+            return parse_windows_timestamp(struct.unpack_from(str("<Q"), d, 0)[0])
         elif data_length < 5 or data_length >= 0x80000000:
-            return self.unpack_dword(0x8)
+            return struct.unpack_from(str("<I"), d, 0)[0]
         else:
             raise UnknownTypeException("Unknown VK Record type 0x%x at 0x%x" % (data_type, self.offset()))
 
@@ -1107,7 +1222,7 @@ class NKRecord(Record):
         @return: ascii string containing the name
         """
         name_length = self.unpack_word(0x48)
-        return self.unpack_string(0x4C, name_length).decode("ascii")
+        return self.unpack_string(0x4C, name_length).decode("windows-1252")
 
     def path(self):
         """
@@ -1149,7 +1264,6 @@ class NKRecord(Record):
         """
         offset = self.abs_offset_from_hbin_offset(self.unpack_dword(0x10))
 
-        # TODO be careful here in setting the parent of the HBINCell
         d = HBINCell(self._buf, offset, self.parent())
         return NKRecord(self._buf, d.data_offset(), self.parent())
 
@@ -1264,7 +1378,7 @@ class HBINBlock(RegistryBlock):
             return False
 
         try:
-            HBINBlock(self._buf, self._offset_next_hbin, self.parent())
+            self.next()
             return True
         except (ParseException, struct.error):
             return False
@@ -1279,23 +1393,20 @@ class HBINBlock(RegistryBlock):
     def cells(self):
         """
         Get a generator that yields each HBINCell contained in this HBIN.
-        """
-        c = HBINCell(self._buf, self._offset + 0x20, self)
-
-        while c.offset() < self._offset_next_hbin:
-            yield c
-            c = c.next()
-
-    def records(self):
-        """
-        A generator that yields each HBINCell contained in this HBIN.
         These are not necessarily in use, or linked to, from the root key.
         """
         c = HBINCell(self._buf, self._offset + 0x20, self)
 
         while c.offset() < self._offset_next_hbin:
             yield c
-            try:
-                c = c.next()
-            except RegistryStructureDoesNotExist:
+            if c.offset() + c.size() == self._offset_next_hbin:
                 break
+            c = c.next()
+
+    def records(self):
+        """
+        Obsolete, use cells instead.
+        """
+        from warnings import warn
+        warn("records is obsolete, use cells instead!")
+        return self.cells()
